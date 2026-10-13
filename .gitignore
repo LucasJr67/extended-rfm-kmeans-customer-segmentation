@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local data and generated research outputs
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+results/tables/*
+!results/tables/.gitkeep
+results/figures/*
+!results/figures/.gitkeep
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
