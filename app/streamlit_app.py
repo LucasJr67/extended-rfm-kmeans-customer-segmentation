@@ -4,6 +4,11 @@ from datetime import date
 import hashlib
 from pathlib import Path
 from io import BytesIO
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 import streamlit as st
@@ -23,7 +28,6 @@ from src.preprocessing import clean_transactions, explore_dataset
 from src.visualization import cluster_scatter_figure, metric_comparison_figure, profile_clusters
 
 
-ROOT = Path(__file__).resolve().parents[1]
 TABLES_DIR = ROOT / "results" / "tables"
 FIGURES_DIR = ROOT / "results" / "figures"
 
