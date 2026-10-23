@@ -1,39 +1,67 @@
-"""Interactive dashboard for the Extended RFM research workflow."""
+"""Interactive research dashboard for Extended RFM Customer Segmentation.
+
+Includes:
+1. Training, model comparison, and internal geometric validation.
+2. Business validation (CLV projection, Retention & Repurchase, Campaign Simulation).
+3. Model persistence and batch customer inference.
+"""
 
 from datetime import date
 import hashlib
-from pathlib import Path
 from io import BytesIO
+from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
+from src.business_validation import (
+    calculate_customer_clv,
+    calculate_retention_metrics,
+    compare_business_separation,
+    simulate_promotional_campaign,
+    summarize_cluster_clv,
+)
 from src.clustering import run_experiments, select_best_k
 from src.config import (
     DEFAULT_K_VALUES,
     DEFAULT_METRIC_SAMPLE_LIMIT,
     DEFAULT_N_INIT,
+    DEFAULT_PROFIT_MARGIN,
     DEFAULT_RANDOM_STATE,
+    DEFAULT_RETENTION_RECENCY_DAYS,
+    DEFAULT_TIME_HORIZON_YEARS,
     FEATURE_DEFINITIONS,
     FEATURE_SETS,
     ColumnMapping,
 )
 from src.features import available_features, build_customer_features
+from src.pipeline_manager import (
+    SegmentationPipeline,
+    create_pipeline_from_experiment,
+    list_saved_pipelines,
+    load_pipeline,
+    predict_customer_segments,
+    save_pipeline,
+)
 from src.preprocessing import clean_transactions, explore_dataset
 from src.visualization import cluster_scatter_figure, metric_comparison_figure, profile_clusters
 
-
 TABLES_DIR = ROOT / "results" / "tables"
 FIGURES_DIR = ROOT / "results" / "figures"
+MODELS_DIR = ROOT / "results" / "models"
 
 
 @st.cache_data(show_spinner=False)
 def read_uploaded_file(content: bytes, filename: str) -> pd.DataFrame:
+    """Read CSV or XLSX files from bytes."""
     suffix = Path(filename).suffix.lower()
     if suffix == ".csv":
         return pd.read_csv(BytesIO(content))
@@ -42,21 +70,49 @@ def read_uploaded_file(content: bytes, filename: str) -> pd.DataFrame:
     raise ValueError("Please upload a CSV or XLSX file.")
 
 
-def _column_selector(label: str, columns: list[str], required: bool) -> str | None:
+def _column_selector(label: str, columns: list[str], required: bool, key_prefix: str = "mapping") -> str | None:
     options = columns if required else ["(not mapped)"] + columns
-    selected = st.selectbox(label, options=options, key=f"mapping_{label}")
+    selected = st.selectbox(label, options=options, key=f"{key_prefix}_{label}")
     return selected if required or selected != "(not mapped)" else None
 
 
-def main() -> None:
-    st.set_page_config(page_title="Extended RFM Research", layout="wide")
-    st.title("Extended RFM Customer Segmentation")
-    st.caption(
-        "Research objective: test whether mapped behavioral features add useful "
-        "geometric structure to traditional RFM. Internal metrics do not establish "
-        "marketing effectiveness."
-    )
-    with st.expander("Research definitions and assumptions", expanded=True):
+def _css_gradient(series: pd.Series, low_rgb: tuple, high_rgb: tuple, reverse: bool = False) -> list[str]:
+    """Return a list of CSS background-color strings interpolated between two RGB colors."""
+    vals = pd.to_numeric(series, errors="coerce")
+    vmin, vmax = vals.min(), vals.max()
+    styles: list[str] = []
+    for v in vals:
+        if pd.isna(v) or vmax == vmin:
+            styles.append("")
+            continue
+        ratio = (v - vmin) / (vmax - vmin)
+        if reverse:
+            ratio = 1.0 - ratio
+        r = int(low_rgb[0] + (high_rgb[0] - low_rgb[0]) * ratio)
+        g = int(low_rgb[1] + (high_rgb[1] - low_rgb[1]) * ratio)
+        b = int(low_rgb[2] + (high_rgb[2] - low_rgb[2]) * ratio)
+        styles.append(f"background-color: rgb({r},{g},{b})")
+    return styles
+
+
+def _color_metrics_row(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply gradient coloring to metric columns without matplotlib."""
+    out = pd.DataFrame("", index=df.index, columns=df.columns)
+    for col in ("silhouette", "dunn"):
+        if col in df.columns:
+            out[col] = _css_gradient(df[col], (255, 255, 255), (187, 247, 208))
+    if "davies_bouldin" in df.columns:
+        out["davies_bouldin"] = _css_gradient(df["davies_bouldin"], (255, 255, 255), (254, 226, 226), reverse=True)
+    if "calinski_harabasz" in df.columns:
+        out["calinski_harabasz"] = _css_gradient(df["calinski_harabasz"], (255, 255, 255), (191, 219, 254))
+    return out
+
+
+# ==============================================================================
+# TAB 1: TRAINING & GEOMETRIC VALIDATION
+# ==============================================================================
+def render_training_tab() -> None:
+    with st.expander("Research definitions and assumptions", expanded=False):
         st.markdown(
             "- Traditional RFM = R, F, M. Configured Extended RFM = R, F, M, D, PS, PR.\n"
             "- F counts unique invoices, not transaction rows. M sums the mapped spend field.\n"
@@ -65,7 +121,8 @@ def main() -> None:
             "- `log1p` and StandardScaler are applied consistently; selected-feature gaps "
             "exclude the same customers from every model."
         )
-    uploaded = st.file_uploader("Upload transaction data", type=["csv", "xlsx"])
+
+    uploaded = st.file_uploader("Upload transaction data", type=["csv", "xlsx"], key="train_uploader")
     if uploaded is None:
         st.info("Upload a CSV or Excel workbook to begin. No sample results are shown.")
         return
@@ -78,6 +135,7 @@ def main() -> None:
     if raw.empty:
         st.error("The uploaded dataset contains no rows.")
         return
+
     raw.columns = raw.columns.map(str)
     st.subheader("Dataset preview and source-column mapping")
     st.write(f"{len(raw):,} transaction rows × {len(raw.columns):,} columns")
@@ -113,6 +171,7 @@ def main() -> None:
     except (ValueError, KeyError, TypeError) as error:
         st.error(f"Dataset validation failed: {error}")
         return
+
     quality_left, quality_right = st.columns(2)
     with quality_left:
         st.write("Column types")
@@ -136,6 +195,7 @@ def main() -> None:
             use_container_width=True,
         )
         st.metric("Exact duplicate rows", exploration["duplicate_rows"])
+
     st.write("Descriptive statistics")
     st.dataframe(exploration["describe"], use_container_width=True)
     st.write("Sequential cleaning report")
@@ -158,11 +218,13 @@ def main() -> None:
     except (ValueError, KeyError, TypeError, OverflowError) as error:
         st.error(f"Could not engineer customer features: {error}")
         return
+
     st.caption(
         f"Analysis date: {feature_report['analysis_date']} · "
         f"{feature_report['customer_count']:,} customers before experiment exclusions"
     )
     st.dataframe(customer_features.head(30), use_container_width=True)
+
     st.write("Available formulas")
     st.dataframe(
         pd.DataFrame(
@@ -206,6 +268,7 @@ def main() -> None:
             min_value=2,
             value=DEFAULT_METRIC_SAMPLE_LIMIT,
         )
+
     signature_payload = repr(
         (
             hashlib.sha256(uploaded.getvalue()).hexdigest(),
@@ -221,8 +284,10 @@ def main() -> None:
         )
     )
     experiment_signature = hashlib.sha256(signature_payload.encode("utf-8")).hexdigest()
+
     if "experiment_result" not in st.session_state:
         st.session_state.experiment_result = None
+
     if st.button("Run clustering experiments", type="primary"):
         if len(selected_extended) < 2:
             st.error("Select at least two available features for the Extended model.")
@@ -237,6 +302,7 @@ def main() -> None:
         if models["Extended RFM"] == models["Traditional RFM"]:
             st.error("The Extended model must use a feature list different from Traditional RFM.")
             return
+
         with st.spinner("Fitting K-Means models and calculating evaluation metrics..."):
             try:
                 result = run_experiments(
@@ -251,24 +317,28 @@ def main() -> None:
             except (ValueError, KeyError, FloatingPointError) as error:
                 st.error(f"Experiment could not run: {error}")
                 return
+
         st.session_state.experiment_result = result
         st.session_state.experiment_models = models
         st.session_state.experiment_analysis_date = feature_report["analysis_date"]
         st.session_state.experiment_signature = experiment_signature
+        st.session_state.random_state = int(random_state)
+        st.session_state.n_init = int(n_init)
         st.session_state.pop("metric_chart_png", None)
         st.session_state.pop("metric_chart_filename", None)
+
         FIGURES_DIR.mkdir(parents=True, exist_ok=True)
         selected_k = select_best_k(result.results)
         for metric in ("silhouette", "davies_bouldin", "calinski_harabasz", "dunn"):
             metric_comparison_figure(result.results, metric, selected_k).write_html(
-                FIGURES_DIR
-                / f"{metric}_by_k_{experiment_signature[:12]}.html"
+                FIGURES_DIR / f"{metric}_by_k_{experiment_signature[:12]}.html"
             )
 
-    result = st.session_state.experiment_result
+    result = st.session_state.get("experiment_result")
     if result is None or st.session_state.get("experiment_signature") != experiment_signature:
         st.info("Run experiments for the current dataset, feature selection, and settings.")
         return
+
     st.subheader("Model comparison")
     st.caption(
         f"Same eligible population: {result.exclusions['eligible_customers']:,} customers; "
@@ -278,6 +348,7 @@ def main() -> None:
     st.write("Population exclusions")
     st.json(result.exclusions)
     st.dataframe(result.results, hide_index=True, use_container_width=True)
+
     best = select_best_k(result.results)
     if best.empty:
         st.warning("No best K selected: Silhouette was undefined for every tested K.")
@@ -307,7 +378,6 @@ def main() -> None:
             "Silhouette / Calinski-Harabasz / Dunn cao hơn = tốt hơn; Davies-Bouldin thấp hơn = tốt hơn."
         )
 
-        # Build comparison dataframe from best rows joined back to results
         comparison_rows = []
         for _, brow in best.iterrows():
             match = result.results[
@@ -330,7 +400,6 @@ def main() -> None:
 
         if len(comparison) >= 2:
             def highlight_winner(df: pd.DataFrame) -> pd.DataFrame:
-                """Color-code cells: green = better, red = worse for each metric."""
                 styles = pd.DataFrame("", index=df.index, columns=df.columns)
                 higher_better = ["Silhouette ↑", "Calinski-Harabasz ↑", "Dunn ↑", "Stability ARI (mean)"]
                 lower_better = ["Davies-Bouldin ↓", "Stability ARI (std)"]
@@ -352,7 +421,6 @@ def main() -> None:
                             if best_idx != worst_idx:
                                 styles.loc[best_idx, col] = "background-color: #D1FAE5; font-weight: 700; color: #065F46"
                                 styles.loc[worst_idx, col] = "background-color: #FEE2E2; color: #991B1B"
-                # Highlight the Best K column
                 for idx in df.index:
                     styles.loc[idx, "Best K"] = "font-weight: 700; background-color: #FDE68A; color: #92400E"
                 return styles
@@ -363,7 +431,6 @@ def main() -> None:
                 use_container_width=True,
             )
 
-            # Auto-generate a textual conclusion
             conclusions = []
             sil = pd.to_numeric(comparison["Silhouette ↑"], errors="coerce")
             if sil.notna().sum() >= 2:
@@ -387,7 +454,6 @@ def main() -> None:
         else:
             st.dataframe(comparison, hide_index=True, use_container_width=True)
 
-        # Expanded metric cards for each best model
         st.write("Chi tiết metrics tại Best K")
         detail_cols = st.columns(len(comparison))
         for col, (_, crow) in zip(detail_cols, comparison.iterrows()):
@@ -419,7 +485,6 @@ def main() -> None:
     best_keys = set(zip(best["model"], best["k"]))
 
     def highlight_selected_k(row: pd.Series) -> list[str]:
-        """Highlight the best-K row with strong background and green silhouette."""
         selected = (row["model"], row["k"]) in best_keys
         if not selected:
             return [""] * len(row)
@@ -441,51 +506,16 @@ def main() -> None:
                 )
         return styles
 
-    def _css_gradient(series: pd.Series, low_rgb: tuple, high_rgb: tuple, reverse: bool = False) -> list[str]:
-        """Return a list of CSS background-color strings interpolated between two RGB colors."""
-        vals = pd.to_numeric(series, errors="coerce")
-        vmin, vmax = vals.min(), vals.max()
-        styles: list[str] = []
-        for v in vals:
-            if pd.isna(v) or vmax == vmin:
-                styles.append("")
-                continue
-            ratio = (v - vmin) / (vmax - vmin)
-            if reverse:
-                ratio = 1.0 - ratio
-            r = int(low_rgb[0] + (high_rgb[0] - low_rgb[0]) * ratio)
-            g = int(low_rgb[1] + (high_rgb[1] - low_rgb[1]) * ratio)
-            b = int(low_rgb[2] + (high_rgb[2] - low_rgb[2]) * ratio)
-            styles.append(f"background-color: rgb({r},{g},{b})")
-        return styles
-
-    def color_metrics_row(df: pd.DataFrame) -> pd.DataFrame:
-        """Apply gradient coloring to metric columns without matplotlib."""
-        out = pd.DataFrame("", index=df.index, columns=df.columns)
-        # higher-is-better: white → green
-        for col in ("silhouette", "dunn"):
-            if col in df.columns:
-                out[col] = _css_gradient(df[col], (255, 255, 255), (187, 247, 208))
-        # lower-is-better: white → red (reverse scale)
-        if "davies_bouldin" in df.columns:
-            out["davies_bouldin"] = _css_gradient(df["davies_bouldin"], (255, 255, 255), (254, 226, 226), reverse=True)
-        # higher-is-better: white → blue
-        if "calinski_harabasz" in df.columns:
-            out["calinski_harabasz"] = _css_gradient(df["calinski_harabasz"], (255, 255, 255), (191, 219, 254))
-        return out
-
     st.write("Detailed results")
     styled = result.results.style.apply(highlight_selected_k, axis=1)
-    styled = styled.apply(lambda df: color_metrics_row(df), axis=None)
-    st.dataframe(
-        styled,
-        hide_index=True,
-        use_container_width=True,
-    )
+    styled = styled.apply(lambda df: _color_metrics_row(df), axis=None)
+    st.dataframe(styled, hide_index=True, use_container_width=True)
     st.caption("Hàng nền vàng/xanh và chữ đậm là K được chọn theo Silhouette cao nhất. "
                "Gradient màu giúp so sánh trực quan giá trị metric giữa các K.")
+
     for metric in metric_names:
         st.plotly_chart(metric_comparison_figure(result.results, metric, best), use_container_width=True)
+
     selected_metric = st.selectbox("Metric chart to export as PNG", metric_names)
     metric_figure = metric_comparison_figure(result.results, selected_metric, best)
     metric_filename = f"{selected_metric}_by_k_{experiment_signature[:12]}.png"
@@ -499,6 +529,7 @@ def main() -> None:
             (FIGURES_DIR / metric_filename).write_bytes(metric_image)
             st.session_state.metric_chart_png = metric_image
             st.session_state.metric_chart_filename = metric_filename
+
     if st.session_state.get("metric_chart_filename") == metric_filename:
         st.download_button(
             "Download selected metric chart (PNG)",
@@ -508,10 +539,7 @@ def main() -> None:
         )
 
     st.subheader("Cluster profiles")
-    choices = [
-        (name, k)
-        for name, k in result.labels
-    ]
+    choices = [(name, k) for name, k in result.labels]
     if choices:
         labels_display = [f"{name} · K={k}" for name, k in choices]
         preferred_choice = (best.iloc[0]["model"], int(best.iloc[0]["k"])) if not best.empty else choices[0]
@@ -539,30 +567,35 @@ def main() -> None:
             ),
             use_container_width=True,
         )
-        FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-        result_name = (
-            f"{choice[0].lower().replace(' ', '_')}_k{choice[1]}_{experiment_signature[:12]}"
+
+        # ── 💾 Model Persistence: Save Pipeline Button ────────────────
+        st.subheader("💾 Lưu Pipeline mô hình (Model Persistence)")
+        st.caption(
+            "Đóng gói quy trình tiền xử lý (Log1p -> StandardScaler) cùng mô hình KMeans đã huấn luyện "
+            "vào file `.joblib` để sử dụng dự đoán tệp khách hàng mới tại Tab 'Dự đoán Khách hàng Mới'."
         )
-        scatter = cluster_scatter_figure(
-            result.scaled_features[choice[0]],
-            result.labels[choice],
-            f"{choice[0]} PCA projection · K={choice[1]}",
-        )
-        try:
-            image = scatter.to_image(format="png")
-        except (ImportError, RuntimeError, ValueError, OSError) as error:
-            st.error(f"PNG export failed. Install Kaleido and Chrome/Chromium: {error}")
-        else:
-            st.download_button(
-                "Download cluster chart (PNG)",
-                data=image,
-                file_name=f"{result_name}_pca.png",
-                mime="image/png",
-            )
-            (FIGURES_DIR / f"{result_name}_pca.png").write_bytes(image)
-        scatter.write_html(FIGURES_DIR / f"{result_name}_pca.html")
-    else:
-        profile = pd.DataFrame()
+        col_save_btn, col_save_status = st.columns([1, 2])
+        with col_save_btn:
+            if st.button(f"Lưu Pipeline [{choice[0]} · K={choice[1]}]", type="secondary"):
+                MODELS_DIR.mkdir(parents=True, exist_ok=True)
+                run_id = experiment_signature[:12]
+                clean_name = choice[0].lower().replace(" ", "_")
+                filename = f"{clean_name}_k{choice[1]}_{run_id}.joblib"
+                target_path = MODELS_DIR / filename
+                pipeline_obj = create_pipeline_from_experiment(
+                    eligible_customer_features=result.eligible_customer_features,
+                    features=st.session_state.experiment_models[choice[0]],
+                    model_name=choice[0],
+                    k=choice[1],
+                    random_state=st.session_state.get("random_state", DEFAULT_RANDOM_STATE),
+                    n_init=st.session_state.get("n_init", DEFAULT_N_INIT),
+                    cluster_profiles=profile,
+                    run_id=run_id,
+                )
+                save_pipeline(pipeline_obj, target_path)
+                st.session_state[f"saved_pipe_{filename}"] = target_path
+                with col_save_status:
+                    st.success(f"✅ Đã lưu thành công pipeline vào: `results/models/{filename}`")
 
     st.subheader("Download and saved outputs")
     TABLES_DIR.mkdir(parents=True, exist_ok=True)
@@ -600,9 +633,7 @@ def main() -> None:
             for (model, k), labels in result.labels.items()
         ],
         ignore_index=True,
-    ) if result.labels else pd.DataFrame(
-        columns=["customer_id", "model", "k", "cluster"]
-    )
+    ) if result.labels else pd.DataFrame(columns=["customer_id", "model", "k", "cluster"])
     assignments_csv = assignments.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download customer assignments (CSV)",
@@ -614,6 +645,356 @@ def main() -> None:
     profiles.to_csv(TABLES_DIR / f"cluster_profiles_{run_id}.csv", index=False)
     assignments.to_csv(TABLES_DIR / f"customer_assignments_{run_id}.csv", index=False)
     st.caption("CSV tables and interactive HTML/PCA chart files are saved under results/.")
+
+
+# ==============================================================================
+# TAB 2: BUSINESS VALIDATION
+# ==============================================================================
+def render_business_validation_tab() -> None:
+    st.header("💼 Xác thực Giá trị Kinh doanh (Business Validation)")
+    st.caption(
+        "Đánh giá kinh tế thực tế của các cụm khách hàng: Dự phóng CLV, Tỷ lệ giữ chân/tái mua, "
+        "Kiểm định phân tách hành vi kinh tế giữa các mô hình, và Mô phỏng chiến dịch tiếp thị."
+    )
+
+    result = st.session_state.get("experiment_result")
+    if result is None:
+        st.info("💡 Chưa có kết quả thực nghiệm. Vui lòng hoàn thành bước phân cụm tại Tab 'Huấn luyện & Đánh giá' trước.")
+        return
+
+    best = select_best_k(result.results)
+    if best.empty:
+        st.warning("Chưa xác định được mô hình tốt nhất từ kết quả.")
+        return
+
+    # Choose model to analyze
+    model_choices = list(result.scaled_features.keys())
+    selected_model = st.selectbox("Chọn mô hình để xác thực kinh doanh", model_choices, index=len(model_choices) - 1)
+    best_row = best.loc[best["model"] == selected_model]
+    best_k = int(best_row.iloc[0]["k"]) if not best_row.empty else 2
+    k_choice = st.number_input(f"Số cụm K ({selected_model})", min_value=2, max_value=10, value=best_k)
+
+    key = (selected_model, int(k_choice))
+    if key not in result.labels:
+        st.error(f"Không tìm thấy nhãn phân cụm cho {selected_model} tại K={k_choice}.")
+        return
+
+    labels = result.labels[key]
+    customer_features = result.eligible_customer_features
+
+    # ── 1. Dự phóng CLV (Customer Lifetime Value) ────────────────────
+    st.subheader("1. Dự phóng CLV (Customer Lifetime Value)")
+    st.caption(
+        r"CLV dự phóng cá nhân hóa theo công thức: "
+        r"$\text{CLV} = M \times P(\text{Active}) \times \text{Profit Margin} \times \text{Time Horizon}$"
+        r", trong đó $P(\text{Active}) = \exp(-\lambda \times R)$ suy giảm theo số ngày chưa mua hàng."
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        margin = st.slider("Biên lợi nhuận gộp (Profit Margin %)", min_value=5, max_value=60, value=int(DEFAULT_PROFIT_MARGIN * 100)) / 100.0
+    with c2:
+        horizon = st.slider("Khung thời gian dự phóng (Năm)", min_value=0.5, max_value=3.0, value=DEFAULT_TIME_HORIZON_YEARS, step=0.5)
+    with c3:
+        half_life = st.number_input("Chu kỳ bán rã Recency (Ngày)", min_value=30, max_value=365, value=180)
+
+    clv_summary = summarize_cluster_clv(
+        customer_features,
+        labels,
+        selected_model,
+        int(k_choice),
+        profit_margin=margin,
+        time_horizon_years=horizon,
+    )
+    st.dataframe(
+        clv_summary.style.format({
+            "mean_clv": "{:,.2f}",
+            "median_clv": "{:,.2f}",
+            "std_clv": "{:,.2f}",
+            "total_projected_clv": "{:,.2f}",
+            "p25_clv": "{:,.2f}",
+            "p75_clv": "{:,.2f}",
+        }),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    fig_clv = px.bar(
+        clv_summary,
+        x="cluster",
+        y="mean_clv",
+        color="cluster",
+        title=f"CLV Trung bình theo từng Cụm ({selected_model} · K={k_choice})",
+        labels={"cluster": "Cụm khách hàng", "mean_clv": "CLV Dự phóng Trung bình"},
+        text_auto=".2f",
+    )
+    st.plotly_chart(fig_clv, use_container_width=True)
+
+    # ── 2. Tỷ lệ Giữ chân / Tái mua ──────────────────────────────────
+    st.divider()
+    st.subheader("2. Tỷ lệ Giữ chân & Tái mua (Retention & Repurchase Rate)")
+    st.caption("Theo dõi khả năng duy trì quan hệ khách hàng và tần suất mua lặp lại của từng cụm.")
+    recency_thresh = st.slider("Ngưỡng Recency để tính khách hàng đang hoạt động (Active Days)", 30, 180, DEFAULT_RETENTION_RECENCY_DAYS, 15)
+    retention_df = calculate_retention_metrics(
+        customer_features,
+        labels,
+        selected_model,
+        int(k_choice),
+        recency_threshold_days=recency_thresh,
+    )
+    st.dataframe(
+        retention_df.style.format({
+            "repurchase_rate": "{:.2%}",
+            "high_frequency_rate": "{:.2%}",
+            "active_rate": "{:.2%}",
+            "median_recency_days": "{:.0f}",
+            "median_frequency": "{:.1f}",
+            "median_monetary": "{:,.2f}",
+        }),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    fig_ret = px.bar(
+        retention_df,
+        x="cluster",
+        y=["repurchase_rate", "active_rate"],
+        barmode="group",
+        title=f"Tỷ lệ Tái mua và Khách hàng Đang hoạt động theo Cụm ({selected_model})",
+        labels={"cluster": "Cụm", "value": "Tỷ lệ (%)", "variable": "Chỉ số"},
+    )
+    st.plotly_chart(fig_ret, use_container_width=True)
+
+    # ── 3. So sánh Phân tách Kinh tế giữa các Mô hình ────────────────
+    st.divider()
+    st.subheader("3. Kiểm định Phân tách Kinh tế: Traditional RFM vs Extended RFM")
+    st.caption(
+        "Sử dụng phân tích phương sai One-Way ANOVA F-test trên các biến kinh tế thực tế. "
+        "F-statistic càng cao chứng minh mô hình phân tách khách hàng theo giá trị kinh tế càng rõ nét."
+    )
+    if len(model_choices) >= 2 and len(best) >= 2:
+        m1, m2 = model_choices[0], model_choices[1]
+        k1 = int(best.loc[best["model"] == m1, "k"].iloc[0])
+        k2 = int(best.loc[best["model"] == m2, "k"].iloc[0])
+        sep_df = compare_business_separation(
+            customer_features,
+            result.labels[(m1, k1)],
+            result.labels[(m2, k2)],
+            profit_margin=margin,
+        )
+        st.dataframe(
+            sep_df.style.format({
+                "f_stat_traditional": "{:.2f}",
+                "f_stat_extended": "{:.2f}",
+                "p_val_traditional": "{:.4e}",
+                "p_val_extended": "{:.4e}",
+                "variance_ratio_diff_pct": "{:+.1f}%",
+            }),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.info("Cần ít nhất 2 mô hình đã chạy thử nghiệm để so sánh phân tách kinh tế.")
+
+    # ── 4. Mô phỏng Chiến dịch Marketing (Campaign Simulation) ──────
+    st.divider()
+    st.subheader("4. Mô phỏng Chiến dịch Marketing (Campaign Simulation)")
+    st.caption(
+        "Mô phỏng hiệu quả tài chính khi nhắm mục tiêu vào một cụm khách hàng cụ thể. "
+        "Đặc biệt hữu ích để kiểm soát rủi ro biên lợi nhuận đối với nhóm Promotional Spend (PS) cao."
+    )
+    unique_clusters = sorted(list(np.unique(labels)))
+    sim_col1, sim_col2 = st.columns(2)
+    with sim_col1:
+        target_cluster = st.selectbox("Chọn cụm khách hàng mục tiêu", unique_clusters, key="sim_target_cluster")
+        discount_rate = st.slider("Mức chiết khấu / Khuyến mại (%)", min_value=5, max_value=35, value=10, step=1) / 100.0
+        expected_response = st.slider("Tỷ lệ phản hồi dự kiến (Response Rate %)", min_value=5, max_value=50, value=15, step=5) / 100.0
+    with sim_col2:
+        mktg_cost = st.number_input("Chi phí marketing/liên hệ mỗi khách ($ / VNĐ)", min_value=0.1, value=1.0, step=0.5)
+        lift_spend = st.slider("Tỷ lệ tăng trưởng doanh thu đơn hàng (Lift %)", min_value=0, max_value=50, value=10, step=5) / 100.0
+
+    sim_res = simulate_promotional_campaign(
+        customer_features,
+        labels,
+        target_cluster=int(target_cluster),
+        discount_rate=discount_rate,
+        expected_response_rate=expected_response,
+        marketing_cost_per_customer=mktg_cost,
+        baseline_margin=margin,
+        lift_in_spend=lift_spend,
+    )
+
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    with sc1:
+        st.metric("Quy mô tiếp cận", f"{sim_res['target_audience_size']:,} khách", f"{sim_res['expected_responders']:,} phản hồi")
+    with sc2:
+        st.metric("Tổng chi phí chiến dịch", f"{sim_res['total_campaign_cost']:,.2f}")
+    with sc3:
+        st.metric("Doanh thu tạo thêm", f"{sim_res['incremental_revenue']:,.2f}")
+    with sc4:
+        st.metric("Lợi nhuận ròng / ROI", f"{sim_res['net_profit']:,.2f}", f"{sim_res['roi_pct']:+.1f}%")
+
+    if "Cảnh báo" in sim_res["risk_assessment"]:
+        st.warning(f"⚠️ {sim_res['risk_assessment']}")
+    else:
+        st.success(f"✅ {sim_res['risk_assessment']}")
+
+
+# ==============================================================================
+# TAB 3: BATCH INFERENCE & SCORING
+# ==============================================================================
+def render_inference_tab() -> None:
+    st.header("🚀 Dự đoán Khách hàng Mới (Batch Inference & Scoring)")
+    st.caption(
+        "Sử dụng pipeline đã lưu (chuẩn hóa + K-Means) để phân cụm và gán nhãn hồ sơ cho danh sách khách hàng mới."
+    )
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    saved_list = list_saved_pipelines(MODELS_DIR)
+
+    pipe_choice_mode = st.radio(
+        "Chọn nguồn mô hình:",
+        ["Chọn từ thư mục kết quả (results/models/)", "Tải lên file pipeline (.joblib)"],
+        horizontal=True,
+    )
+
+    pipeline: SegmentationPipeline | None = None
+    if pipe_choice_mode == "Chọn từ thư mục kết quả (results/models/)":
+        if not saved_list:
+            st.warning("Chưa có pipeline nào được lưu trong `results/models/`. Hãy huấn luyện mô hình ở Tab 1 và nhấn 'Lưu Pipeline'.")
+        else:
+            opts = [f"{p['filename']} ({p['model_name']} · K={p['k']})" for p in saved_list]
+            selected_idx = st.selectbox("Chọn pipeline:", range(len(opts)), format_func=lambda i: opts[i])
+            chosen_path = saved_list[selected_idx]["path"]
+            try:
+                pipeline = load_pipeline(chosen_path)
+            except Exception as e:
+                st.error(f"Lỗi nạp pipeline: {e}")
+    else:
+        uploaded_pipe = st.file_uploader("Tải lên file .joblib", type=["joblib"])
+        if uploaded_pipe is not None:
+            tmp_pipe_path = MODELS_DIR / f"_temp_{uploaded_pipe.name}"
+            tmp_pipe_path.write_bytes(uploaded_pipe.getvalue())
+            try:
+                pipeline = load_pipeline(tmp_pipe_path)
+            except Exception as e:
+                st.error(f"Không thể đọc file pipeline: {e}")
+
+    if pipeline is not None:
+        st.info(
+            f"📦 **Pipeline đang chọn:** `{pipeline.model_name}` | "
+            f"**Số cụm K:** `{pipeline.k}` | "
+            f"**Đặc trưng yêu cầu:** `{', '.join(pipeline.features)}` | "
+            f"**Thời gian lưu:** `{pipeline.created_at[:19]}`"
+        )
+
+        st.subheader("Tải lên dữ liệu khách hàng mới")
+        new_data_file = st.file_uploader("Tải lên danh sách khách hàng mới (CSV / XLSX)", type=["csv", "xlsx"], key="inference_data_uploader")
+        if new_data_file is None:
+            st.info("Vui lòng tải lên file dữ liệu khách hàng mới để tiến hành phân cụm.")
+            return
+
+        try:
+            new_df = read_uploaded_file(new_data_file.getvalue(), new_data_file.name)
+        except Exception as e:
+            st.error(f"Không thể đọc file: {e}")
+            return
+
+        new_df.columns = new_df.columns.map(str)
+        st.write(f"Tập dữ liệu tải lên: {len(new_df):,} dòng × {len(new_df.columns)} cột")
+        st.dataframe(new_df.head(10), use_container_width=True)
+
+        # Check if table already has features or is raw transactions
+        has_all_features = all(f in new_df.columns for f in pipeline.features)
+        if has_all_features:
+            customer_table = new_df.copy()
+            st.success("✅ Dữ liệu đã có sẵn đầy đủ các cột đặc trưng mô hình yêu cầu!")
+        else:
+            st.warning("Dữ liệu chưa có sẵn đủ các cột đặc trưng. Nếu đây là dữ liệu giao dịch thô, vui lòng ánh xạ cột để tính toán:")
+            cols = list(new_df.columns)
+            m_c1, m_c2 = st.columns(2)
+            with m_c1:
+                cid = _column_selector("Customer ID (required)", cols, True, key_prefix="inf")
+                oid = _column_selector("Order ID (required)", cols, True, key_prefix="inf")
+                pdate = _column_selector("Purchase Date (required)", cols, True, key_prefix="inf")
+            with m_c2:
+                sp = _column_selector("Spend Amount (required)", cols, True, key_prefix="inf")
+                cat = _column_selector("Category (for D)", cols, False, key_prefix="inf")
+                promo = _column_selector("Promo Spend (for PS)", cols, False, key_prefix="inf")
+
+            mapping_inf = ColumnMapping(cid, oid, pdate, sp, cat, promo)
+            try:
+                cleaned_inf, _ = clean_transactions(new_df, mapping_inf)
+                customer_table, _ = build_customer_features(cleaned_inf, mapping_inf)
+                st.success(f"✅ Đã trích xuất đặc trưng cho {len(customer_table):,} khách hàng.")
+            except Exception as e:
+                st.error(f"Lỗi xử lý giao dịch: {e}")
+                return
+
+        if st.button("🚀 Phân cụm khách hàng mới (Batch Scoring)", type="primary"):
+            try:
+                scored = predict_customer_segments(pipeline, customer_table)
+            except Exception as e:
+                st.error(f"Lỗi dự đoán phân cụm: {e}")
+                return
+
+            st.subheader("Kết quả Phân cụm Khách hàng Mới")
+            assigned_only = scored[scored["status"] == "assigned"]
+            st.caption(f"Đã gán nhãn thành công cho {len(assigned_only):,} / {len(scored):,} khách hàng.")
+
+            if not assigned_only.empty:
+                # Distribution chart
+                cluster_counts = assigned_only["predicted_cluster"].value_counts().reset_index()
+                cluster_counts.columns = ["cluster", "count"]
+                cluster_counts["cluster"] = cluster_counts["cluster"].astype(int).astype(str)
+
+                fig_dist = px.bar(
+                    cluster_counts,
+                    x="cluster",
+                    y="count",
+                    title="Phân bổ Khách hàng Mới theo Cụm",
+                    labels={"cluster": "Cụm khách hàng", "count": "Số lượng khách"},
+                    color="cluster",
+                    text_auto=True,
+                )
+                st.plotly_chart(fig_dist, use_container_width=True)
+
+            st.dataframe(scored, use_container_width=True)
+
+            # Download CSV
+            scored_csv = scored.to_csv(index=True).encode("utf-8")
+            st.download_button(
+                "Tải xuống kết quả phân cụm (CSV)",
+                data=scored_csv,
+                file_name=f"new_customer_segments_{pipeline.model_name.lower().replace(' ', '_')}.csv",
+                mime="text/csv",
+            )
+
+
+# ==============================================================================
+# MAIN ENTRYPOINT
+# ==============================================================================
+def main() -> None:
+    st.set_page_config(page_title="Extended RFM Research", layout="wide")
+    st.title("Extended RFM Customer Segmentation")
+    st.caption(
+        "Nghiên cứu & Ứng dụng: Phân khúc khách hàng đa chiều bằng K-Means trên RFM Mở rộng (R, F, M, D, PS, PR), "
+        "kết hợp kiểm chứng hình học, xác thực giá trị kinh doanh và chấm điểm khách hàng mới."
+    )
+
+    tab_train, tab_business, tab_inference = st.tabs([
+        "🔬 Huấn luyện & Đánh giá (Train & Validate)",
+        "💼 Xác thực Giá trị Kinh doanh (Business Validation)",
+        "🚀 Dự đoán Khách hàng Mới (Batch Inference)",
+    ])
+
+    with tab_train:
+        render_training_tab()
+
+    with tab_business:
+        render_business_validation_tab()
+
+    with tab_inference:
+        render_inference_tab()
 
 
 if __name__ == "__main__":

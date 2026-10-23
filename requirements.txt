@@ -7,3 +7,4 @@ streamlit==1.50.0
 openpyxl==3.1.5
 kaleido==1.1.0
 pytest==8.4.2
+joblib==1.6.0

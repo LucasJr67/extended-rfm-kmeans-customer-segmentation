@@ -50,18 +50,30 @@ The expected source fields are transaction-level: one or more rows per order, wi
 ## Project layout
 
 ```text
-src/                 Reusable loading, cleaning, feature, clustering, and evaluation code
-app/streamlit_app.py Interactive research dashboard
-tests/               Formula, edge-case, metric, and end-to-end tests
-data/raw/            Put private source datasets here (ignored by Git)
-data/processed/      Optional local processed data (ignored by Git)
-results/tables/      Generated experiment and profile CSVs (ignored by Git)
-results/figures/     Generated chart files (ignored by Git)
+src/
+  ├── config.py              Feature definitions, business constants, and project-wide defaults
+  ├── preprocessing.py       Input loading, exploration, and transaction cleaning
+  ├── features.py            Customer-level feature engineering (R, F, M, D, PS, PR)
+  ├── evaluation.py          Clustering geometric metrics & stratified sampling
+  ├── clustering.py          K-Means experiments, ARI stability, and Best K selection
+  ├── visualization.py       Plotly figures (metrics by K, PCA 2D) and cluster profiling
+  ├── business_validation.py CLV projection, retention rates, ANOVA separation, campaign simulation
+  └── pipeline_manager.py    Model serialization (.joblib) and new customer batch scoring
+app/
+  └── streamlit_app.py       3-Tab Interactive dashboard (Train, Business Validation, Batch Inference)
+tests/                       29 unit and integration tests covering all modules
+results/
+  ├── tables/                Generated experiment and profile CSVs
+  ├── figures/               Generated chart files (HTML & PNG)
+  └── models/                Serialized model pipelines (.joblib)
+data/raw/                    Private source datasets (ignored by Git)
 ```
 
 The app works directly with an uploaded file, so placing data in `data/raw/` is optional. Never commit identifiable or otherwise sensitive customer data.
 
 ## Reusable API
+
+### 1. Training & Clustering Experiment
 
 ```python
 from datetime import date
@@ -88,8 +100,65 @@ experiment = run_experiments(
 print(experiment.results)
 ```
 
-The example mapping is illustrative: replace every column name with a verified field from your own dataset. `PS` is intentionally omitted from the example feature set because its source semantics cannot be presumed.
+### 2. Business Validation & Economic Metrics
+
+```python
+from src.business_validation import (
+    calculate_customer_clv,
+    summarize_cluster_clv,
+    calculate_retention_metrics,
+    simulate_promotional_campaign,
+)
+
+labels = experiment.labels[("Extended RFM", 2)]
+# Projected Customer Lifetime Value
+clv = calculate_customer_clv(experiment.eligible_customer_features, profit_margin=0.20)
+clv_summary = summarize_cluster_clv(experiment.eligible_customer_features, labels, "Extended RFM", 2)
+
+# Retention & Repurchase Rates
+retention = calculate_retention_metrics(experiment.eligible_customer_features, labels, "Extended RFM", 2)
+
+# Marketing Campaign Simulation (Targeting Cluster 0)
+campaign = simulate_promotional_campaign(
+    experiment.eligible_customer_features,
+    labels,
+    target_cluster=0,
+    discount_rate=0.10,
+    expected_response_rate=0.15,
+)
+print(f"Projected Campaign ROI: {campaign['roi_pct']:.1f}%")
+```
+
+### 3. Model Persistence & Batch Customer Inference
+
+```python
+from src.pipeline_manager import (
+    create_pipeline_from_experiment,
+    save_pipeline,
+    load_pipeline,
+    predict_customer_segments,
+)
+
+# Save fitted pipeline
+pipeline = create_pipeline_from_experiment(
+    eligible_customer_features=experiment.eligible_customer_features,
+    features=("R", "F", "M", "D", "PR"),
+    model_name="Extended RFM",
+    k=2,
+    random_state=42,
+    n_init=10,
+    cluster_profiles=profile_clusters(experiment.eligible_customer_features, labels, "Extended RFM", 2),
+    run_id="run_01",
+)
+save_pipeline(pipeline, "results/models/extended_rfm_k2.joblib")
+
+# Load and predict on new customers
+loaded = load_pipeline("results/models/extended_rfm_k2.joblib")
+new_assignments = predict_customer_segments(loaded, new_customer_features)
+print(new_assignments[["predicted_cluster", "segment_description"]])
+```
 
 ## Limitations
 
-Results depend on source-data semantics, the selected features, scaling, and K-Means assumptions. Customers with insufficient purchase history have no PR value and are excluded when PR is selected so both models retain a comparable population. A missing category or valid promotional-spend column prevents that feature from being computed. Silhouette and other internal indices assess geometric properties only; they do not measure business value, customer lifetime value, or campaign lift.
+Results depend on source-data semantics, the selected features, scaling, and K-Means assumptions. Customers with insufficient purchase history have no PR value and are excluded when PR is selected so both models retain a comparable population. A missing category or valid promotional-spend column prevents that feature from being computed. Silhouette and other internal indices assess geometric properties only, which is why the dashboard complements them with economic validation (CLV, Retention, and Campaign ROI simulation).
+

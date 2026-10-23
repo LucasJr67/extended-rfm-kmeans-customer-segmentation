@@ -37,3 +37,7 @@ DEFAULT_RANDOM_STATE: Final[int] = 42
 DEFAULT_N_INIT: Final[int] = 10
 DEFAULT_K_VALUES: Final[tuple[int, ...]] = tuple(range(2, 11))
 DEFAULT_METRIC_SAMPLE_LIMIT: Final[int] = 2000
+
+DEFAULT_PROFIT_MARGIN: Final[float] = 0.20
+DEFAULT_RETENTION_RECENCY_DAYS: Final[int] = 90
+DEFAULT_TIME_HORIZON_YEARS: Final[float] = 1.0
