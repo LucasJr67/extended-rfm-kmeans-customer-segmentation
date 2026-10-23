@@ -60,7 +60,12 @@ src/
   ├── business_validation.py CLV projection, retention rates, ANOVA separation, campaign simulation
   └── pipeline_manager.py    Model serialization (.joblib) and new customer batch scoring
 app/
-  └── streamlit_app.py       3-Tab Interactive dashboard (Train, Business Validation, Batch Inference)
+  ├── streamlit_app.py       Main dashboard launcher (slim entrypoint)
+  ├── ui_common.py           Shared UI helpers, file loaders, column selectors, CSS gradients
+  └── tabs/
+      ├── training.py        Tab 1: Training, EDA, K-Means experiments, & Model saving
+      ├── business.py        Tab 2: CLV projection, retention, ANOVA separation, & Campaign simulation
+      └── inference.py       Tab 3: Batch customer segment scoring & CSV export
 tests/                       29 unit and integration tests covering all modules
 results/
   ├── tables/                Generated experiment and profile CSVs
@@ -161,4 +166,3 @@ print(new_assignments[["predicted_cluster", "segment_description"]])
 ## Limitations
 
 Results depend on source-data semantics, the selected features, scaling, and K-Means assumptions. Customers with insufficient purchase history have no PR value and are excluded when PR is selected so both models retain a comparable population. A missing category or valid promotional-spend column prevents that feature from being computed. Silhouette and other internal indices assess geometric properties only, which is why the dashboard complements them with economic validation (CLV, Retention, and Campaign ROI simulation).
-
