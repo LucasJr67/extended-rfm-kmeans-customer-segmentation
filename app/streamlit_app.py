@@ -258,8 +258,9 @@ def main() -> None:
         st.session_state.pop("metric_chart_png", None)
         st.session_state.pop("metric_chart_filename", None)
         FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+        selected_k = select_best_k(result.results)
         for metric in ("silhouette", "davies_bouldin", "calinski_harabasz", "dunn"):
-            metric_comparison_figure(result.results, metric).write_html(
+            metric_comparison_figure(result.results, metric, selected_k).write_html(
                 FIGURES_DIR
                 / f"{metric}_by_k_{experiment_signature[:12]}.html"
             )
@@ -284,16 +285,209 @@ def main() -> None:
         st.write("Declared selection: maximum Silhouette within each feature set; ties choose smaller K.")
         st.dataframe(best, hide_index=True, use_container_width=True)
 
+        cards = st.columns(len(best))
+        for column, (_, choice) in zip(cards, best.iterrows(), strict=True):
+            with column:
+                st.metric(
+                    f"{choice['model']} — best K",
+                    f"K = {int(choice['k'])}",
+                    f"Silhouette {choice['silhouette']:.3f}",
+                )
+        st.caption(
+            "K được chọn theo Silhouette cao nhất trong từng feature set; đây là kết quả "
+            "đánh giá hình học của cụm, không phải kết luận về hiệu quả kinh doanh."
+        )
+
+        # ── 🏆 Best K summary comparison ──────────────────────────────
+        st.divider()
+        st.subheader("🏆 Kết quả tốt nhất – So sánh Best K giữa các model")
+        st.caption(
+            "Bảng tổng hợp tất cả internal metrics tại K tốt nhất của mỗi model. "
+            "Ô màu xanh = metric tốt hơn, ô màu đỏ nhạt = metric kém hơn. "
+            "Silhouette / Calinski-Harabasz / Dunn cao hơn = tốt hơn; Davies-Bouldin thấp hơn = tốt hơn."
+        )
+
+        # Build comparison dataframe from best rows joined back to results
+        comparison_rows = []
+        for _, brow in best.iterrows():
+            match = result.results[
+                (result.results["model"] == brow["model"])
+                & (result.results["k"] == brow["k"])
+            ]
+            if not match.empty:
+                r = match.iloc[0]
+                comparison_rows.append({
+                    "Model": r["model"],
+                    "Best K": int(r["k"]),
+                    "Silhouette ↑": r.get("silhouette"),
+                    "Davies-Bouldin ↓": r.get("davies_bouldin"),
+                    "Calinski-Harabasz ↑": r.get("calinski_harabasz"),
+                    "Dunn ↑": r.get("dunn"),
+                    "Stability ARI (mean)": r.get("stability_ari_mean"),
+                    "Stability ARI (std)": r.get("stability_ari_std"),
+                })
+        comparison = pd.DataFrame(comparison_rows)
+
+        if len(comparison) >= 2:
+            def highlight_winner(df: pd.DataFrame) -> pd.DataFrame:
+                """Color-code cells: green = better, red = worse for each metric."""
+                styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                higher_better = ["Silhouette ↑", "Calinski-Harabasz ↑", "Dunn ↑", "Stability ARI (mean)"]
+                lower_better = ["Davies-Bouldin ↓", "Stability ARI (std)"]
+                for col in higher_better:
+                    if col in df.columns:
+                        vals = pd.to_numeric(df[col], errors="coerce")
+                        if vals.notna().sum() >= 2:
+                            best_idx = vals.idxmax()
+                            worst_idx = vals.idxmin()
+                            if best_idx != worst_idx:
+                                styles.loc[best_idx, col] = "background-color: #D1FAE5; font-weight: 700; color: #065F46"
+                                styles.loc[worst_idx, col] = "background-color: #FEE2E2; color: #991B1B"
+                for col in lower_better:
+                    if col in df.columns:
+                        vals = pd.to_numeric(df[col], errors="coerce")
+                        if vals.notna().sum() >= 2:
+                            best_idx = vals.idxmin()
+                            worst_idx = vals.idxmax()
+                            if best_idx != worst_idx:
+                                styles.loc[best_idx, col] = "background-color: #D1FAE5; font-weight: 700; color: #065F46"
+                                styles.loc[worst_idx, col] = "background-color: #FEE2E2; color: #991B1B"
+                # Highlight the Best K column
+                for idx in df.index:
+                    styles.loc[idx, "Best K"] = "font-weight: 700; background-color: #FDE68A; color: #92400E"
+                return styles
+
+            st.dataframe(
+                comparison.style.apply(highlight_winner, axis=None),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            # Auto-generate a textual conclusion
+            conclusions = []
+            sil = pd.to_numeric(comparison["Silhouette ↑"], errors="coerce")
+            if sil.notna().sum() >= 2:
+                winner_idx = sil.idxmax()
+                winner_model = comparison.loc[winner_idx, "Model"]
+                winner_k = int(comparison.loc[winner_idx, "Best K"])
+                winner_val = sil.loc[winner_idx]
+                conclusions.append(
+                    f"**{winner_model}** đạt Silhouette cao nhất ({winner_val:.4f}) tại **K = {winner_k}**"
+                )
+            db = pd.to_numeric(comparison["Davies-Bouldin ↓"], errors="coerce")
+            if db.notna().sum() >= 2:
+                winner_idx = db.idxmin()
+                winner_model = comparison.loc[winner_idx, "Model"]
+                winner_val = db.loc[winner_idx]
+                conclusions.append(
+                    f"**{winner_model}** đạt Davies-Bouldin thấp nhất ({winner_val:.4f})"
+                )
+            if conclusions:
+                st.info("📊 " + " · ".join(conclusions))
+        else:
+            st.dataframe(comparison, hide_index=True, use_container_width=True)
+
+        # Expanded metric cards for each best model
+        st.write("Chi tiết metrics tại Best K")
+        detail_cols = st.columns(len(comparison))
+        for col, (_, crow) in zip(detail_cols, comparison.iterrows()):
+            with col:
+                st.markdown(f"**{crow['Model']} · K = {int(crow['Best K'])}**")
+                m_col1, m_col2 = st.columns(2)
+                with m_col1:
+                    sil_val = crow.get("Silhouette ↑")
+                    st.metric("Silhouette ↑", f"{sil_val:.4f}" if pd.notna(sil_val) else "N/A")
+                    ch_val = crow.get("Calinski-Harabasz ↑")
+                    st.metric("Calinski-Harabasz ↑", f"{ch_val:.1f}" if pd.notna(ch_val) else "N/A")
+                with m_col2:
+                    db_val = crow.get("Davies-Bouldin ↓")
+                    st.metric("Davies-Bouldin ↓", f"{db_val:.4f}" if pd.notna(db_val) else "N/A")
+                    dunn_val = crow.get("Dunn ↑")
+                    st.metric("Dunn ↑", f"{dunn_val:.4f}" if pd.notna(dunn_val) else "N/A")
+                ari_mean = crow.get("Stability ARI (mean)")
+                ari_std = crow.get("Stability ARI (std)")
+                if pd.notna(ari_mean):
+                    st.metric("Stability ARI", f"{ari_mean:.4f} ± {ari_std:.4f}" if pd.notna(ari_std) else f"{ari_mean:.4f}")
+        st.divider()
+
     st.write("Internal metric comparison")
     st.caption(
         "Internal metrics describe geometry, not business value. Metric scores depend on "
         "feature space; do not use Calinski–Harabasz alone to rank different feature sets."
     )
     metric_names = ("silhouette", "davies_bouldin", "calinski_harabasz", "dunn")
+    best_keys = set(zip(best["model"], best["k"]))
+
+    def highlight_selected_k(row: pd.Series) -> list[str]:
+        """Highlight the best-K row with strong background and green silhouette."""
+        selected = (row["model"], row["k"]) in best_keys
+        if not selected:
+            return [""] * len(row)
+        styles = []
+        for col in row.index:
+            if col == "silhouette":
+                styles.append(
+                    "font-weight: 700; background-color: #BBF7D0; color: #065F46; "
+                    "border-left: 4px solid #059669"
+                )
+            elif col == "k":
+                styles.append(
+                    "font-weight: 700; background-color: #FDE68A; color: #92400E; "
+                    "border-left: 4px solid #F59E0B; font-size: 1.05em"
+                )
+            else:
+                styles.append(
+                    "font-weight: 700; background-color: #FEF3C7; color: #111827"
+                )
+        return styles
+
+    def _css_gradient(series: pd.Series, low_rgb: tuple, high_rgb: tuple, reverse: bool = False) -> list[str]:
+        """Return a list of CSS background-color strings interpolated between two RGB colors."""
+        vals = pd.to_numeric(series, errors="coerce")
+        vmin, vmax = vals.min(), vals.max()
+        styles: list[str] = []
+        for v in vals:
+            if pd.isna(v) or vmax == vmin:
+                styles.append("")
+                continue
+            ratio = (v - vmin) / (vmax - vmin)
+            if reverse:
+                ratio = 1.0 - ratio
+            r = int(low_rgb[0] + (high_rgb[0] - low_rgb[0]) * ratio)
+            g = int(low_rgb[1] + (high_rgb[1] - low_rgb[1]) * ratio)
+            b = int(low_rgb[2] + (high_rgb[2] - low_rgb[2]) * ratio)
+            styles.append(f"background-color: rgb({r},{g},{b})")
+        return styles
+
+    def color_metrics_row(df: pd.DataFrame) -> pd.DataFrame:
+        """Apply gradient coloring to metric columns without matplotlib."""
+        out = pd.DataFrame("", index=df.index, columns=df.columns)
+        # higher-is-better: white → green
+        for col in ("silhouette", "dunn"):
+            if col in df.columns:
+                out[col] = _css_gradient(df[col], (255, 255, 255), (187, 247, 208))
+        # lower-is-better: white → red (reverse scale)
+        if "davies_bouldin" in df.columns:
+            out["davies_bouldin"] = _css_gradient(df["davies_bouldin"], (255, 255, 255), (254, 226, 226), reverse=True)
+        # higher-is-better: white → blue
+        if "calinski_harabasz" in df.columns:
+            out["calinski_harabasz"] = _css_gradient(df["calinski_harabasz"], (255, 255, 255), (191, 219, 254))
+        return out
+
+    st.write("Detailed results")
+    styled = result.results.style.apply(highlight_selected_k, axis=1)
+    styled = styled.apply(lambda df: color_metrics_row(df), axis=None)
+    st.dataframe(
+        styled,
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption("Hàng nền vàng/xanh và chữ đậm là K được chọn theo Silhouette cao nhất. "
+               "Gradient màu giúp so sánh trực quan giá trị metric giữa các K.")
     for metric in metric_names:
-        st.plotly_chart(metric_comparison_figure(result.results, metric), use_container_width=True)
+        st.plotly_chart(metric_comparison_figure(result.results, metric, best), use_container_width=True)
     selected_metric = st.selectbox("Metric chart to export as PNG", metric_names)
-    metric_figure = metric_comparison_figure(result.results, selected_metric)
+    metric_figure = metric_comparison_figure(result.results, selected_metric, best)
     metric_filename = f"{selected_metric}_by_k_{experiment_signature[:12]}.png"
     if st.button("Prepare metric chart PNG"):
         try:
@@ -320,7 +514,11 @@ def main() -> None:
     ]
     if choices:
         labels_display = [f"{name} · K={k}" for name, k in choices]
-        selected_display = st.selectbox("Profile and visualize a fitted model", labels_display)
+        preferred_choice = (best.iloc[0]["model"], int(best.iloc[0]["k"])) if not best.empty else choices[0]
+        default_index = choices.index(preferred_choice) if preferred_choice in choices else 0
+        selected_display = st.selectbox(
+            "Profile and visualize a fitted model", labels_display, index=default_index
+        )
         choice = choices[labels_display.index(selected_display)]
         profile = profile_clusters(
             result.eligible_customer_features,
@@ -342,7 +540,9 @@ def main() -> None:
             use_container_width=True,
         )
         FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-        result_name = f"{choice[0].lower().replace(' ', '_')}_k{choice[1]}"
+        result_name = (
+            f"{choice[0].lower().replace(' ', '_')}_k{choice[1]}_{experiment_signature[:12]}"
+        )
         scatter = cluster_scatter_figure(
             result.scaled_features[choice[0]],
             result.labels[choice],

@@ -6,18 +6,88 @@ import plotly.graph_objects as go
 from sklearn.decomposition import PCA
 
 
-def metric_comparison_figure(results: pd.DataFrame, metric: str) -> go.Figure:
-    """Build a metric-by-K comparison chart."""
+_BEST_K_COLORS: dict[int, str] = {
+    0: "#2563EB",   # blue-600
+    1: "#DC2626",   # red-600
+    2: "#059669",   # emerald-600
+    3: "#7C3AED",   # violet-600
+}
+
+
+def metric_comparison_figure(
+    results: pd.DataFrame, metric: str, best_k: pd.DataFrame | None = None
+) -> go.Figure:
+    """Build a metric-by-K chart, optionally emphasizing selected K values.
+
+    When *best_k* is supplied the chart highlights each selected K with:
+    * a vertical dashed line spanning the full plot height,
+    * a prominent annotation box showing the metric value.
+    """
     if metric not in results.columns:
         raise ValueError(f"Unknown metric {metric!r}.")
+    metric_label = metric.replace("_", " ").title()
     figure = px.line(
         results,
         x="k",
         y=metric,
         color="model",
         markers=True,
-        title=f"{metric.replace('_', ' ').title()} by K",
-        labels={"k": "Number of clusters (K)", metric: metric.replace("_", " ").title()},
+        title=f"{metric_label} by K",
+        labels={"k": "Number of clusters (K)", metric: metric_label},
+    )
+
+    subtitle_parts: list[str] = []
+
+    if best_k is not None and not best_k.empty:
+        selected = best_k.loc[:, ["model", "k"]].merge(
+            results.loc[:, ["model", "k", metric]], on=["model", "k"], how="left"
+        ).dropna(subset=[metric])
+        if not selected.empty:
+            for idx, (_, row) in enumerate(selected.iterrows()):
+                color = _BEST_K_COLORS.get(idx, "#6B7280")
+                k_val = int(row["k"])
+                metric_val = float(row[metric])
+                model_name = row["model"]
+
+                # Vertical dashed line at best K
+                figure.add_vline(
+                    x=k_val,
+                    line_dash="dash",
+                    line_color=color,
+                    line_width=2,
+                    opacity=0.6,
+                )
+
+                # Annotation box with metric value
+                figure.add_annotation(
+                    x=k_val,
+                    y=metric_val,
+                    text=f"<b>Best K={k_val}</b><br>{model_name}<br>{metric_label}: {metric_val:.4f}",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1.2,
+                    arrowwidth=2,
+                    arrowcolor=color,
+                    ax=40 if idx % 2 == 0 else -40,
+                    ay=-50 if idx % 2 == 0 else -60,
+                    bordercolor=color,
+                    borderwidth=2,
+                    borderpad=6,
+                    bgcolor="white",
+                    opacity=0.95,
+                    font={"size": 12, "color": color},
+                )
+
+                subtitle_parts.append(f"{model_name}: Best K = {k_val}")
+
+    subtitle_text = ""
+    if subtitle_parts:
+        subtitle_text = f"<br><span style='font-size:12px;color:#6B7280'>{' · '.join(subtitle_parts)}</span>"
+
+    figure.update_layout(
+        title={"text": f"<b>{metric_label} by K</b>{subtitle_text}"},
+        legend_title_text="Model",
+        hoverlabel={"font": {"size": 14}},
     )
     return figure
 
